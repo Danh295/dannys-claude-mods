@@ -41,3 +41,7 @@ claude plugin validate plugins/jot    # what the engine would refuse
 ```
 
 Opening a mod with `--plugin-dir` writes its API typings to `plugins/<mod>/.claude-plugin/types/` (git-ignored); after that, `npx -p typescript tsc -p plugins/<mod> --noEmit` type-checks it.
+
+## License
+
+[MIT](LICENSE)

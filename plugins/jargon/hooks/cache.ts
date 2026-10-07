@@ -57,8 +57,3 @@ export function parseCache(raw: string): CacheFile | null {
     skipped: count(o.skipped),
   }
 }
-
-/** The reply's words Haiku has never read: none means the call is skipped. */
-export function novelWords(words: readonly string[], seen: ReadonlySet<string>): string[] {
-  return words.filter(w => !seen.has(w))
-}

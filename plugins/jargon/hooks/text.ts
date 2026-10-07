@@ -36,9 +36,14 @@ function escape(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-/** Matches the term as a whole word, any case. */
+/** All capitals (and digits): matched as written, so "RED" never matches "red". */
+export function isAcronym(term: string): boolean {
+  return /^[A-Z0-9]{2,}$/.test(term) && /[A-Z]/.test(term)
+}
+
+/** Matches the term as a whole word, any case unless it is an acronym. */
 export function termPattern(term: string): RegExp {
-  return new RegExp(`(?<![\\w-])${escape(term)}(?![\\w-])`, 'i')
+  return new RegExp(`(?<![\\w-])${escape(term)}(?![\\w-])`, isAcronym(term) ? '' : 'i')
 }
 
 export function hasTerm(text: string, term: string): boolean {
@@ -52,9 +57,9 @@ export function hasTerm(text: string, term: string): boolean {
 export function termMatcher(
   entries: ReadonlyArray<readonly [slug: string, term: string]>,
 ): (text: string) => string[] {
-  const bySpelling = new Map<string, string>()
+  const bySpelling = new Map<string, { slug: string; term: string }>()
   for (const [s, term] of entries) {
-    if (term.trim() !== '') bySpelling.set(term.toLowerCase(), s)
+    if (term.trim() !== '') bySpelling.set(term.toLowerCase(), { slug: s, term })
   }
   if (bySpelling.size === 0) return () => []
 
@@ -64,8 +69,9 @@ export function termMatcher(
   return text => {
     const out = new Set<string>()
     for (const m of text.matchAll(pattern)) {
-      const s = bySpelling.get(m[0].toLowerCase())
-      if (s !== undefined) out.add(s)
+      const entry = bySpelling.get(m[0].toLowerCase())
+      if (entry === undefined || (isAcronym(entry.term) && m[0] !== entry.term)) continue
+      out.add(entry.slug)
     }
 
     return [...out]
@@ -192,31 +198,27 @@ function baseForms(word: string): string[] {
 }
 
 /** An everyday English word, or an inflection of one (see scripts/common-words.py). */
-export function isCommonWord(word: string): boolean {
+function isCommonWord(word: string): boolean {
   common ??= new Set(COMMON_WORDS.split(' '))
   const set = common
 
   return baseForms(word.toLowerCase()).some(w => set.has(w))
 }
 
-const CODE_FILE = /\.(?:jsx?|tsx?|mjs|cjs|py|rb|go|rs|java|kt|swift|json|ya?ml|toml|css|scss|html|sh|lock)$/i
+const CODE_FILE = /\.(?:jsx?|tsx?|mjs|cjs|py|rb|go|rs|java|kt|swift|json|ya?ml|toml|css|scss|html|sh|lock|md)$/i
 
 /**
  * Whether a term can be jargon at all. Never: one everyday word on its own
  * ("tests", "pass", "validates": it may still head a phrase like "unit
- * test"), or a name from the person's own code (commit hashes, paths, file
- * names, SCREAMING_SNAKE and lowerCamel identifiers). Acronyms and odd
- * spellings (CORS, GraphQL, C++, node.js) always can.
+ * test"), a commit hash, or a path. Acronyms and odd spellings (CORS,
+ * GraphQL, C++, node.js) always can. Other names from the person's code are
+ * left out by `parseExtraction`, which wants a term in the reply's prose.
  */
 export function isJargonCandidate(term: string): boolean {
   const t = term.trim()
   if (t === '') return false
   if (/^[0-9a-f]{7,40}$/i.test(t) && /\d/.test(t)) return false
-  if (/^[A-Z][A-Z0-9]*_[A-Z0-9_]*$/.test(t)) return false
-  if (/^[a-z]{2,}(?:[A-Z][a-z0-9]+)+$/.test(t)) return false
   if (t.includes('/') && (/^[.~]/.test(t) || CODE_FILE.test(t) || /\/.*\//.test(t))) return false
-  // A file name, but not a library named like one (node.js, next.js).
-  if (!/\s/.test(t) && CODE_FILE.test(t) && !/^[a-z]+\.js$/.test(t)) return false
   if (/^[A-Za-z][a-z]+$/.test(t) && isCommonWord(t)) return false
 
   return true
@@ -230,7 +232,8 @@ function clip(value: unknown, max: number): string {
 }
 
 /**
- * Reads the model's JSON answer: keeps entries whose term is in `text`, one
+ * Reads the model's JSON answer: keeps entries that can be jargon and appear
+ * in the prose of `text` (a name seen only in code is the person's own), one
  * per slug, at most MAX_TERMS; `dropped` names the terms past that cap.
  * An answer that is no JSON array (cut off, wrapped in prose) is null.
  */
@@ -250,6 +253,7 @@ export function parseExtraction(
   }
   if (!Array.isArray(data)) return null
 
+  const prose = proseOf(text)
   const seen = new Set<string>()
   const out: Extracted[] = []
   const dropped: string[] = []
@@ -258,7 +262,7 @@ export function parseExtraction(
     const o = item as Record<string, unknown>
     const term = clip(o.term, 60)
     const definition = clip(o.definition, 200)
-    if (!term || !definition || !hasTerm(text, term) || !isJargonCandidate(term)) continue
+    if (!term || !definition || !hasTerm(prose, term) || !isJargonCandidate(term)) continue
     const s = slug(term)
     if (seen.has(s)) continue
     seen.add(s)

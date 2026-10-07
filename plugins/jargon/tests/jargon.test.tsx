@@ -1,10 +1,9 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 
-import { emptyCache, novelWords, parseCache } from '../hooks/cache'
+import { emptyCache, parseCache } from '../hooks/cache'
 import { cardLeft, cellWidth, chipOffsets } from '../hooks/card'
 import {
   hash,
-  isCommonWord,
   isJargonCandidate,
   linkTerms,
   parseExtraction,
@@ -75,8 +74,8 @@ describe('text helpers', () => {
 
 describe('only technical terms', () => {
   const NOISY =
-    'The tests pass and it validates the input; commit 7f6652c touched src/lib/nav.js, ' +
-    'freeNav and BARS_MEASURED. A mutex keeps it idempotent; CORS, GraphQL and C++ too, ' +
+    'The tests pass and it validates the input; commit 7f6652c touched `src/lib/nav.js`, ' +
+    '`freeNav` and `BARS_MEASURED`. A mutex keeps it idempotent; CORS, GraphQL and C++ too, ' +
     'to avoid a race condition.'
 
   test('everyday words and project names are dropped from what Haiku finds', async () => {
@@ -88,22 +87,42 @@ describe('only technical terms', () => {
     ])
   })
 
-  test('common words count in any inflection', async () => {
-    for (const w of ['validate', 'validates', 'validated', 'validating', 'Tests', 'passed']) {
-      expect(isCommonWord(w)).toBe(true)
+  test('everyday words are dropped in any inflection', async () => {
+    for (const w of ['validate', 'validates', 'validated', 'validating', 'Tests', 'passed', 'Tab', 'hook']) {
+      expect(isJargonCandidate(w)).toBe(false)
     }
     for (const w of ['mutex', 'idempotent', 'viewport', 'shim', 'git', 'json']) {
-      expect(isCommonWord(w)).toBe(false)
+      expect(isJargonCandidate(w)).toBe(true)
     }
   })
 
-  test('acronyms, odd spellings and phrases stay candidates', async () => {
-    for (const t of ['DNS', 'TCP/IP', 'node.js', 'macOS', 'WebSocket', 'unit test', 'React hook', 'diffs']) {
+  test('acronyms, odd spellings, API names and phrases stay; hashes and paths go', async () => {
+    for (const t of ['DNS', 'TCP/IP', 'node.js', 'macOS', 'WebSocket', 'unit test', 'React hook',
+      'diffs', 'useEffect', 'localStorage', 'NODE_ENV', 'package.json']) {
       expect(isJargonCandidate(t)).toBe(true)
     }
-    for (const t of ['Tab', 'theme', 'hook', 'deadbeef1', 'useSectionSettle.js', 'typeIn', './run.sh']) {
+    for (const t of ['deadbeef1', '7f6652c', './run.sh', 'src/lib/nav.js', 'docs/a/b']) {
       expect(isJargonCandidate(t)).toBe(false)
     }
+  })
+
+  test('a name seen only in code is the person\'s own', async () => {
+    const text = 'Call `freeNav` from the effect: useEffect runs after each render.'
+    const raw = JSON.stringify(['freeNav', 'useEffect'].map(term => ({ term, kind: 'k', definition: 'd' })))
+    expect(parseExtraction(raw, text)?.found.map(f => f.term)).toEqual(['useEffect'])
+  })
+
+  test('acronyms match only as written', async () => {
+    const find = termMatcher([
+      ['red', 'RED'],
+      ['head', 'HEAD'],
+      ['mutex', 'mutex'],
+    ])
+    expect(find('a red button at the head of the list, behind a Mutex')).toEqual(['mutex'])
+    expect(find('Run RED first, then move HEAD.')).toEqual(['red', 'head'])
+    expect(linkTerms('a red flag, then RED', ['RED']).text).toBe(
+      'a red flag, then [RED ⓘ](https://jargon.invalid/red)',
+    )
   })
 })
 
@@ -170,12 +189,6 @@ describe('cache', () => {
     expect(words).toContain('node.js')
     expect(words).not.toContain('secretword')
     expect(wordsOf('Run npm over ssh, sign a JWT.')).toEqual(['run', 'npm', 'over', 'ssh', 'sign', 'jwt'])
-  })
-
-  test('a reply of words Haiku has read is skipped', async () => {
-    const seen = new Set(wordsOf(REPLY))
-    expect(novelWords(wordsOf(REPLY), seen)).toEqual([])
-    expect(novelWords(wordsOf(REPLY + ' semaphore'), seen)).toEqual(['semaphore'])
   })
 
   test('the file round-trips and a cut-off file reads as null', async () => {
@@ -349,4 +362,71 @@ test('saved terms that are not jargon are dropped at start and never drawn', asy
 
   const file = JSON.parse(written[written.length - 1] ?? '{}')
   expect(Object.keys(file.glossary ?? {})).toEqual(['mutex'])
+})
+
+test('a reply goes to Haiku, only its jargon is drawn, and the save keeps another session\'s', async ($, on) => {
+  mock.store(on)
+  mock.env(on, { HOME: '/tmp/jargon-test' })
+  const clock = mock.clock(on)
+  const path = '/tmp/jargon-test/.claude/jargon/cache.json'
+  const files = new Map<string, string>()
+  on('fs.exists', ($, e) => ({ value: files.has(e.path) }))
+  on('fs.read', ($, e) => ({ value: files.get(e.path) ?? '' }))
+  on('fs.write', ($, e) => {
+    files.set(e.path, e.text)
+
+    return { value: undefined }
+  })
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  const asked: string[] = []
+  on('model.complete', ($, e) => {
+    asked.push(e.prompt ?? '')
+    const terms = ['tests', 'pass', 'mutex']
+
+    return {
+      value: {
+        isAnswered: true,
+        text: JSON.stringify(terms.map(term => ({ term, kind: 'k', definition: `about ${term}` }))),
+        usage: { input_tokens: 1, output_tokens: 1 },
+      },
+    }
+  })
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  // Another session saves CORS after this one started.
+  files.set(path, JSON.stringify({
+    version: 1,
+    glossary: { cors: { term: 'CORS', kind: 'k', definition: 'about CORS' } },
+    seen: ['cors'],
+    asked: 4,
+    skipped: 0,
+  }))
+
+  const text = 'The tests pass now that a mutex guards the write, so two saves never land at once.'
+  await $.session.append({
+    message: { type: 'assistant', content: [{ type: 'text', text }] },
+    door: 'response',
+    origin: { kind: 'model', model: 'test' },
+    uuid: 'u1',
+  })
+  await clock.settle()
+  expect(asked).toHaveLength(1)
+
+  const ui = await $.ui.mount({
+    plugin: 'jargon',
+    surface: 'terminal',
+    component: 'AssistantMessage',
+    requestId: 'm5',
+    viewport: { columns: 100, rows: 40 },
+    props: { text, isFirstOfReply: true },
+  })
+  expect(await ui.find({ type: 'Button', key: 'chip-mutex' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'chip-tests' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'chip-pass' })).toBeUndefined()
+  await ui.unmount()
+
+  const file = JSON.parse(files.get(path) ?? '{}')
+  expect(Object.keys(file.glossary)).toEqual(['cors', 'mutex'])
+  expect(file.asked).toBe(5)
 })

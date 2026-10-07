@@ -2,15 +2,16 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { JargonEntry, JargonGlossary, JargonNotes, JargonPin } from '../types'
-import { MAX_SEEN, emptyCache, novelWords, parseCache } from './cache'
+import { emptyCache, parseCache } from './cache'
 import type { CacheFile } from './cache'
 import { card, cardLeft, cardWidth, chipOffsets } from './card'
+import { admit, keepJargon, merge } from './glossary'
+import type { Counts } from './glossary'
 import {
   EXTRACT_SYSTEM,
   LINK_ROOT,
   MAX_TERMS,
   hasTerm,
-  isJargonCandidate,
   linkTerms,
   parseExtraction,
   replyKey,
@@ -25,8 +26,6 @@ const isOn = atom({ plugin: 'jargon', key: 'isOn' } as const, true)
 
 const STORE_KEY = 'glossary'
 const BACKUP_KEY = 'cache'
-const MAX_GLOSSARY = 500
-const MAX_REPLIES = 60
 const MIN_REPLY_CHARS = 80
 // One reply in this many that would be skipped is checked anyway, so a
 // multi-word term made of familiar words ("race condition") is still found.
@@ -34,18 +33,13 @@ const RECHECK_EVERY = 10
 
 type Term = JargonEntry & { slug: string }
 
-function keepLast<T>(record: Record<string, T>, max: number): Record<string, T> {
-  const keys = Object.keys(record)
-  if (keys.length <= max) return record
-
-  return Object.fromEntries(keys.slice(-max).map(k => [k, record[k] as T]))
-}
-
 // The cache file is the module's own: read at session.start (a reload too),
-// written after each answer Haiku gives and each skip. `$.store` keeps a copy
-// so a file left broken never costs the glossary.
-let cache: CacheFile = emptyCache()
+// written after each answer Haiku gives and each skip, merged with what is on
+// disk so sessions side by side keep each other's terms. `$.store` keeps a
+// copy so a file left broken never costs the glossary.
 let seen = new Set<string>()
+let counts: Counts = { asked: 0, skipped: 0 }
+let saved: Counts = { asked: 0, skipped: 0 }
 let pending = new Set<string>()
 let skipStreak = 0
 let cachePath = ''
@@ -63,27 +57,33 @@ const CHIP_LEAD = 'Terms'.length
 const CHIP_GAP = 2
 const termsMemo = new Map<string, Term[]>()
 
-/** The glossary without entries that can't be jargon (saved before the filter existed). */
-function onlyJargon(known: JargonGlossary): JargonGlossary {
-  return Object.fromEntries(Object.entries(known).filter(([, t]) => isJargonCandidate(t.term)))
-}
-
 function debug($: EngineInterface, line: string): void {
   $.ui.log(`jargon: ${line}`, { to: 'debug' })
 }
 
-async function save($: EngineInterface): Promise<void> {
-  cache = {
-    ...cache,
-    glossary: await read($, glossary),
-    seen: [...seen].slice(-MAX_SEEN),
-  }
-  const snapshot = cache
-  const text = JSON.stringify(snapshot, null, 2)
+/**
+ * Writes the glossary, read words and counts, merged with the file as it is
+ * now. Two saves from two sessions landing in the same instant can still
+ * lose one's changes.
+ */
+function save($: EngineInterface): Promise<void> {
   writing = writing
     .then(async () => {
-      await $.store.set(BACKUP_KEY, snapshot)
-      if (cachePath) await $.fs.write(cachePath, text)
+      const raw = cachePath && (await $.fs.exists(cachePath)) ? String(await $.fs.read(cachePath)) : ''
+      const sent = counts
+      const file = merge(raw ? parseCache(raw) : null, {
+        glossary: await read($, glossary),
+        seen,
+        counts: sent,
+      })
+      await $.store.set(BACKUP_KEY, file)
+      if (cachePath) await $.fs.write(cachePath, JSON.stringify(file, null, 2))
+      // Take in what other sessions saved, keeping what this one found meanwhile.
+      const none = { asked: 0, skipped: 0 }
+      await update($, glossary, now => merge(file, { glossary: now, seen: [], counts: none }).glossary)
+      seen = new Set([...file.seen, ...seen])
+      saved = { asked: file.asked, skipped: file.skipped }
+      counts = { asked: counts.asked - sent.asked, skipped: counts.skipped - sent.skipped }
     })
     .catch(err => debug($, `could not save the cache: ${String(err)}`))
 
@@ -131,7 +131,7 @@ function termsFor(text: string, known: JargonGlossary, own: Record<string, strin
   const add = (s: string) => {
     const entry = known[s]
     if (entry === undefined || taken.has(s) || out.length >= MAX_TERMS) return
-    if (!hasTerm(text, entry.term) || !isJargonCandidate(entry.term)) return
+    if (!hasTerm(text, entry.term)) return
     taken.add(s)
     out.push({ ...entry, slug: s })
   }
@@ -172,52 +172,34 @@ async function extract($: EngineInterface, text: string, words: string[]): Promi
   // of terms past the cap, which a later reply asks about.
   const left = new Set(parsed.dropped.flatMap(wordsOf))
   for (const w of words) if (!left.has(w)) seen.add(w)
-  cache = { ...cache, asked: cache.asked + 1 }
-
-  const { found } = parsed
-  if (found.length > 0) {
-    await update($, glossary, all => {
-      const next = { ...all }
-      for (const f of found) {
-        delete next[f.slug]
-        next[f.slug] = { term: f.term, kind: f.kind, definition: f.definition }
-      }
-
-      return keepLast(next, MAX_GLOSSARY)
-    })
-    await update($, notes, all => {
-      const own: Record<string, string> = {}
-      for (const f of found) own[f.slug] = f.context
-      const key = replyKey(text)
-      const next = { ...all }
-      delete next[key]
-      next[key] = own
-
-      return keepLast(next, MAX_REPLIES)
-    })
-  }
+  counts = { ...counts, asked: counts.asked + 1 }
+  const own = await read($, notes)
+  const next = admit(await read($, glossary), own, parsed.found, text)
+  await update($, glossary, () => next.glossary)
+  if (next.notes !== own) await update($, notes, () => next.notes)
   await save($)
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    let cache = emptyCache()
     try {
       const home = await $.env.get('HOME')
       cachePath = home ? `${home}/.claude/jargon/cache.json` : ''
       cache = await loadCache($)
     } catch (err) {
-      cache = emptyCache()
       $.ui.log(`jargon: could not read the cache, starting empty: ${String(err)}`)
     }
     seen = new Set(cache.seen)
+    saved = { asked: cache.asked, skipped: cache.skipped }
+    counts = { asked: 0, skipped: 0 }
     pending = new Set()
     let dropped = 0
     await update($, glossary, known => {
-      const all = { ...cache.glossary, ...known }
-      const kept = onlyJargon(all)
-      dropped = Object.keys(all).length - Object.keys(kept).length
+      const kept = keepJargon({ ...cache.glossary, ...known })
+      dropped = kept.dropped
 
-      return kept
+      return kept.glossary
     })
     if (dropped > 0) {
       debug($, `dropped ${dropped} saved terms that are not jargon`)
@@ -249,11 +231,12 @@ export const register: Register = on => {
       .slice(-40)
       .reverse()
       .map(t => `**${t.term}**: ${t.definition}`)
-    const total = cache.asked + cache.skipped
-    const saved = total > 0 ? `Haiku skipped on ${cache.skipped} of ${total} replies. ` : ''
+    const skipped = saved.skipped + counts.skipped
+    const total = saved.asked + counts.asked + skipped
+    const spared = total > 0 ? `Haiku skipped on ${skipped} of ${total} replies. ` : ''
     const where = cachePath ? `Cache: ${cachePath}` : 'Cache: kept in the plugin store (no HOME)'
 
-    return { text: [...lines, '', `${saved}${where}`].join('\n') }
+    return { text: [...lines, '', `${spared}${where}`].join('\n') }
   })
 
   on('session.append', async ($, e, next) => {
@@ -267,11 +250,11 @@ export const register: Register = on => {
       if (text.trim().length < MIN_REPLY_CHARS) continue
 
       const words = wordsOf(text)
-      const fresh = novelWords(words, seen).filter(w => !pending.has(w))
+      const fresh = words.filter(w => !seen.has(w) && !pending.has(w))
       if (fresh.length === 0 && skipStreak < RECHECK_EVERY - 1) {
         // Every word was read before: known terms highlight from the cache.
         skipStreak += 1
-        cache = { ...cache, skipped: cache.skipped + 1 }
+        counts = { ...counts, skipped: counts.skipped + 1 }
         void save($)
         continue
       }

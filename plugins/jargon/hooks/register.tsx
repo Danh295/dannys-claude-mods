@@ -14,6 +14,7 @@ import {
   hasTerm,
   linkTerms,
   parseExtraction,
+  proseOf,
   replyKey,
   termMatcher,
   wordsOf,
@@ -114,7 +115,10 @@ async function loadCache($: EngineInterface): Promise<CacheFile> {
   return emptyCache()
 }
 
-/** The terms a reply shows: its own extraction first, then any known term in it. */
+/**
+ * The terms a reply shows: its own extraction first, then any known term in
+ * its prose (a name only in its code is the person's own).
+ */
 function termsFor(text: string, known: JargonGlossary, own: Record<string, string>): Term[] {
   const slugs = Object.keys(known)
   const version = `${slugs.length}:${slugs[slugs.length - 1] ?? ''}`
@@ -126,17 +130,18 @@ function termsFor(text: string, known: JargonGlossary, own: Record<string, strin
   const memo = termsMemo.get(memoKey)
   if (memo !== undefined) return memo
 
+  const prose = proseOf(text)
   const out: Term[] = []
   const taken = new Set<string>()
   const add = (s: string) => {
     const entry = known[s]
     if (entry === undefined || taken.has(s) || out.length >= MAX_TERMS) return
-    if (!hasTerm(text, entry.term)) return
+    if (!hasTerm(prose, entry.term)) return
     taken.add(s)
     out.push({ ...entry, slug: s })
   }
   for (const s of Object.keys(own)) add(s)
-  for (const s of matcher.find(text)) add(s)
+  for (const s of matcher.find(prose)) add(s)
 
   if (termsMemo.size > 300) termsMemo.clear()
   termsMemo.set(memoKey, out)

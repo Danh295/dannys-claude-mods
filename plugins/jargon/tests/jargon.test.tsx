@@ -430,3 +430,30 @@ test('a reply goes to Haiku, only its jargon is drawn, and the save keeps anothe
   expect(Object.keys(file.glossary)).toEqual(['cors', 'mutex'])
   expect(file.asked).toBe(5)
 })
+
+test('a saved name that appears only in code gets no chip', async ($, on) => {
+  mock.store(on, {
+    glossary: {
+      freenav: { term: 'freeNav', kind: 'k', definition: 'made up' },
+      mutex: { term: 'mutex', kind: 'k', definition: 'A lock for one task at a time.' },
+    },
+  })
+  mock.env(on, { HOME: '/tmp/jargon-test' })
+  on('fs.exists', () => ({ value: false }))
+  on('fs.write', () => ({ value: undefined }))
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount({
+    plugin: 'jargon',
+    surface: 'terminal',
+    component: 'AssistantMessage',
+    requestId: 'm6',
+    viewport: { columns: 100, rows: 40 },
+    props: { text: 'Call `freeNav` after the mutex is released.', isFirstOfReply: true },
+  })
+  expect(await ui.find({ type: 'Button', key: 'chip-mutex' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'chip-freenav' })).toBeUndefined()
+  await ui.unmount()
+})

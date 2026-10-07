@@ -1,4 +1,5 @@
 import type { JargonEntry } from '../types'
+import { COMMON_WORDS } from './common'
 
 export const LINK_ROOT = 'https://jargon.invalid/'
 export const MAX_TERMS = 8
@@ -166,6 +167,61 @@ export function linkTerms(
   return { text: parts.map(p => p.text).join(''), links }
 }
 
+let common: Set<string> | null = null
+
+/** The word and the forms it may be inflected from: "validates" -> "validate". */
+function baseForms(word: string): string[] {
+  const out = [word]
+  const strip = (suffix: string, add = '') => {
+    if (word.endsWith(suffix) && word.length - suffix.length >= 3) {
+      out.push(word.slice(0, -suffix.length) + add)
+    }
+  }
+  strip('ies', 'y')
+  strip('es')
+  strip('s')
+  strip('ed')
+  strip('ed', 'e')
+  strip('d')
+  strip('ing')
+  strip('ing', 'e')
+  const doubled = /(.)\1(?:ed|ing)$/.exec(word)
+  if (doubled !== null) out.push(word.slice(0, doubled.index + 1))
+
+  return out
+}
+
+/** An everyday English word, or an inflection of one (see scripts/common-words.py). */
+export function isCommonWord(word: string): boolean {
+  common ??= new Set(COMMON_WORDS.split(' '))
+  const set = common
+
+  return baseForms(word.toLowerCase()).some(w => set.has(w))
+}
+
+const CODE_FILE = /\.(?:jsx?|tsx?|mjs|cjs|py|rb|go|rs|java|kt|swift|json|ya?ml|toml|css|scss|html|sh|lock)$/i
+
+/**
+ * Whether a term can be jargon at all. Never: one everyday word on its own
+ * ("tests", "pass", "validates": it may still head a phrase like "unit
+ * test"), or a name from the person's own code (commit hashes, paths, file
+ * names, SCREAMING_SNAKE and lowerCamel identifiers). Acronyms and odd
+ * spellings (CORS, GraphQL, C++, node.js) always can.
+ */
+export function isJargonCandidate(term: string): boolean {
+  const t = term.trim()
+  if (t === '') return false
+  if (/^[0-9a-f]{7,40}$/i.test(t) && /\d/.test(t)) return false
+  if (/^[A-Z][A-Z0-9]*_[A-Z0-9_]*$/.test(t)) return false
+  if (/^[a-z]{2,}(?:[A-Z][a-z0-9]+)+$/.test(t)) return false
+  if (t.includes('/') && (/^[.~]/.test(t) || CODE_FILE.test(t) || /\/.*\//.test(t))) return false
+  // A file name, but not a library named like one (node.js, next.js).
+  if (!/\s/.test(t) && CODE_FILE.test(t) && !/^[a-z]+\.js$/.test(t)) return false
+  if (/^[A-Za-z][a-z]+$/.test(t) && isCommonWord(t)) return false
+
+  return true
+}
+
 function clip(value: unknown, max: number): string {
   if (typeof value !== 'string') return ''
   const s = value.replace(/\s+/g, ' ').trim()
@@ -202,7 +258,7 @@ export function parseExtraction(
     const o = item as Record<string, unknown>
     const term = clip(o.term, 60)
     const definition = clip(o.definition, 200)
-    if (!term || !definition || !hasTerm(text, term)) continue
+    if (!term || !definition || !hasTerm(text, term) || !isJargonCandidate(term)) continue
     const s = slug(term)
     if (seen.has(s)) continue
     seen.add(s)
@@ -222,14 +278,15 @@ export function parseExtraction(
   return { found: out, dropped }
 }
 
-export const EXTRACT_SYSTEM = `You find jargon in a coding assistant's reply so a reader who is new to programming can look it up.
+export const EXTRACT_SYSTEM = `You find technical jargon in a coding assistant's reply so a reader can look it up. The reader knows general computing (files, apps, folders, browsers, the internet) but not the software-development trade.
 
 Answer with a JSON array only, no prose, at most ${MAX_TERMS} items:
 [{"term": "...", "kind": "...", "definition": "...", "context": "..."}]
 
-- term: copied exactly as it appears in the reply. Technical terms, acronyms, tool and protocol names, and jargon. Skip everyday words and words any beginner knows (file, code, function, error).
+- term: copied exactly as it appears in the reply. Only terms whose meaning that reader could not guess from everyday English: specialist concepts, acronyms, and names of tools, protocols, libraries and languages.
+- Skip everyday words even when they are about code: test, pass, fail, validate, check, run, fix, build, change, save, update, error, file, folder, setting, version. Skip names from the person's own project: its files, folders, variables, functions, components, commit hashes and branch names.
 - kind: two or three words naming what it is and its field, like "adjective, APIs" or "tool, version control".
-- definition: plain English, at most 18 words, without using the term itself.
+- definition: plain English, at most 18 words, without using the term itself. Never guess what an acronym stands for.
 - context: at most 16 words on what it means or does in this reply.
 
-If there is nothing worth explaining, answer [].`
+Most replies have little or no jargon: [] is a normal answer, and ${MAX_TERMS} is a limit, not a target.`

@@ -10,6 +10,7 @@ import {
   LINK_ROOT,
   MAX_TERMS,
   hasTerm,
+  isJargonCandidate,
   linkTerms,
   parseExtraction,
   replyKey,
@@ -61,6 +62,11 @@ let transcriptColumns: number | undefined
 const CHIP_LEAD = 'Terms'.length
 const CHIP_GAP = 2
 const termsMemo = new Map<string, Term[]>()
+
+/** The glossary without entries that can't be jargon (saved before the filter existed). */
+function onlyJargon(known: JargonGlossary): JargonGlossary {
+  return Object.fromEntries(Object.entries(known).filter(([, t]) => isJargonCandidate(t.term)))
+}
 
 function debug($: EngineInterface, line: string): void {
   $.ui.log(`jargon: ${line}`, { to: 'debug' })
@@ -125,7 +131,7 @@ function termsFor(text: string, known: JargonGlossary, own: Record<string, strin
   const add = (s: string) => {
     const entry = known[s]
     if (entry === undefined || taken.has(s) || out.length >= MAX_TERMS) return
-    if (!hasTerm(text, entry.term)) return
+    if (!hasTerm(text, entry.term) || !isJargonCandidate(entry.term)) return
     taken.add(s)
     out.push({ ...entry, slug: s })
   }
@@ -205,7 +211,18 @@ export const register: Register = on => {
     }
     seen = new Set(cache.seen)
     pending = new Set()
-    await update($, glossary, known => ({ ...cache.glossary, ...known }))
+    let dropped = 0
+    await update($, glossary, known => {
+      const all = { ...cache.glossary, ...known }
+      const kept = onlyJargon(all)
+      dropped = Object.keys(all).length - Object.keys(kept).length
+
+      return kept
+    })
+    if (dropped > 0) {
+      debug($, `dropped ${dropped} saved terms that are not jargon`)
+      await save($)
+    }
     await $.command.register({
       name: 'jargon',
       description: 'Jargon highlights: on, off, or list the terms defined so far',

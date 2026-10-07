@@ -4,6 +4,8 @@ import { emptyCache, novelWords, parseCache } from '../hooks/cache'
 import { cardLeft, cellWidth, chipOffsets } from '../hooks/card'
 import {
   hash,
+  isCommonWord,
+  isJargonCandidate,
   linkTerms,
   parseExtraction,
   replyKey,
@@ -68,6 +70,40 @@ describe('text helpers', () => {
     expect(parseExtraction('no json here', REPLY)).toBeNull()
     expect(parseExtraction('[{"term": "mutex", "definition": "A lo', REPLY)).toBeNull()
     expect(parseExtraction('[]', REPLY)).toEqual({ found: [], dropped: [] })
+  })
+})
+
+describe('only technical terms', () => {
+  const NOISY =
+    'The tests pass and it validates the input; commit 7f6652c touched src/lib/nav.js, ' +
+    'freeNav and BARS_MEASURED. A mutex keeps it idempotent; CORS, GraphQL and C++ too, ' +
+    'to avoid a race condition.'
+
+  test('everyday words and project names are dropped from what Haiku finds', async () => {
+    const terms = ['tests', 'pass', 'validates', 'commit', '7f6652c', 'src/lib/nav.js', 'freeNav',
+      'BARS_MEASURED', 'mutex', 'idempotent', 'CORS', 'GraphQL', 'C++', 'race condition']
+    const raw = JSON.stringify(terms.map(term => ({ term, kind: 'k', definition: 'd' })))
+    expect(parseExtraction(raw, NOISY)?.found.map(f => f.term)).toEqual([
+      'mutex', 'idempotent', 'CORS', 'GraphQL', 'C++', 'race condition',
+    ])
+  })
+
+  test('common words count in any inflection', async () => {
+    for (const w of ['validate', 'validates', 'validated', 'validating', 'Tests', 'passed']) {
+      expect(isCommonWord(w)).toBe(true)
+    }
+    for (const w of ['mutex', 'idempotent', 'viewport', 'shim', 'git', 'json']) {
+      expect(isCommonWord(w)).toBe(false)
+    }
+  })
+
+  test('acronyms, odd spellings and phrases stay candidates', async () => {
+    for (const t of ['DNS', 'TCP/IP', 'node.js', 'macOS', 'WebSocket', 'unit test', 'React hook', 'diffs']) {
+      expect(isJargonCandidate(t)).toBe(true)
+    }
+    for (const t of ['Tab', 'theme', 'hook', 'deadbeef1', 'useSectionSettle.js', 'typeIn', './run.sh']) {
+      expect(isJargonCandidate(t)).toBe(false)
+    }
   })
 })
 
@@ -277,4 +313,40 @@ test('on a narrow screen each card opens leftwards to stay on screen', async ($,
   // Row 38 wide (40 less the bullet); cards 36 wide. idempotent sits at 7, mutex at 19.
   expect(lefts).toEqual([-5, -17])
   await ui.unmount()
+})
+
+test('saved terms that are not jargon are dropped at start and never drawn', async ($, on) => {
+  const saved = {
+    tests: { term: 'tests', kind: 'noun', definition: 'Code that checks code.' },
+    mutex: { term: 'mutex', kind: 'noun', definition: 'A lock for one task at a time.' },
+  }
+  mock.store(on, { glossary: saved })
+  mock.env(on, { HOME: '/tmp/jargon-test' })
+  const written: string[] = []
+  on('fs.exists', () => ({ value: false }))
+  on('fs.write', ($, e) => {
+    written.push(e.text)
+
+    return { value: undefined }
+  })
+  on('command.register', ($, e) => ({ value: { command: e.name } }))
+  on('session.start', ($, e) => ({ cwd: e.cwd }))
+  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+
+  const ui = await $.ui.mount({
+    plugin: 'jargon',
+    surface: 'terminal',
+    component: 'AssistantMessage',
+    requestId: 'm4',
+    viewport: { columns: 100, rows: 40 },
+    props: { text: 'The tests pass now that a mutex guards the write.', isFirstOfReply: true },
+  })
+  const md = await ui.find({ type: 'Markdown', key: 'reply' })
+  expect(md?.text).toContain('[mutex ⓘ]')
+  expect(md?.text).not.toContain('[tests ⓘ]')
+  expect(await ui.find({ type: 'Button', key: 'chip-tests' })).toBeUndefined()
+  await ui.unmount()
+
+  const file = JSON.parse(written[written.length - 1] ?? '{}')
+  expect(Object.keys(file.glossary ?? {})).toEqual(['mutex'])
 })

@@ -15,7 +15,7 @@
       "name": "jargon",
       "source": "./plugins/jargon",
       "description": "Highlights jargon in Claude's replies; hover or click a term for a plain-English definition",
-      "version": "0.1.0"
+      "version": "0.1.1"
     }
   ]
 }

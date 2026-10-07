@@ -1,0 +1,9 @@
+{
+  "name": "jargon",
+  "version": "0.1.0",
+  "description": "Highlights jargon in Claude's replies; hover or click a term for a plain-English definition",
+  "author": {
+    "name": "Danny"
+  },
+  "types": "./types/index.d.ts"
+}

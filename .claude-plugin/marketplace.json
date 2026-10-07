@@ -1,0 +1,21 @@
+{
+  "name": "dannys-claude-mods",
+  "owner": {
+    "name": "Danny"
+  },
+  "description": "Danny's Claude Code mods: a notes pane and a jargon explainer.",
+  "plugins": [
+    {
+      "name": "jot",
+      "source": "./plugins/jot",
+      "description": "A notes pane: jot text during a session, keep it across sessions, arrow to a note and press Enter to paste it into the prompt.",
+      "version": "0.2.1"
+    },
+    {
+      "name": "jargon",
+      "source": "./plugins/jargon",
+      "description": "Highlights jargon in Claude's replies; hover or click a term for a plain-English definition",
+      "version": "0.1.0"
+    }
+  ]
+}

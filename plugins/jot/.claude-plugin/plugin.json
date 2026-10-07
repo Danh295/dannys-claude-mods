@@ -1,0 +1,9 @@
+{
+  "name": "jot",
+  "version": "0.2.1",
+  "description": "A notes pane: jot text during a session, keep it across sessions, arrow to a note and press Enter to paste it into the prompt.",
+  "author": {
+    "name": "Danny"
+  },
+  "types": "./types/index.d.ts"
+}

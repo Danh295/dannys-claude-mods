@@ -1,12 +1,9 @@
-import type { JargonEntry } from '../types'
-import { COMMON_WORDS } from './common'
-
 export const LINK_ROOT = 'https://jargon.invalid/'
-export const MAX_TERMS = 8
 /** Drawn after each linked term, inside the link, so the mark presses with the word. */
 export const MARK = 'ⓘ'
 
-export type Extracted = JargonEntry & { slug: string; context: string }
+/** What Haiku answers for one term: the entry's text and how the reply uses it. */
+export type Definition = { kind: string; definition: string; context: string }
 
 export function slug(term: string): string {
   const s = term
@@ -36,12 +33,18 @@ function escape(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-/** All capitals (and digits): matched as written, so "RED" never matches "red". */
+/**
+ * True when every letter is a capital and there are at least two (REST, PR,
+ * CI/CD, UTF-8): such a term matches only in capitals, so "the rest of" never
+ * reads as REST.
+ */
 export function isAcronym(term: string): boolean {
-  return /^[A-Z0-9]{2,}$/.test(term) && /[A-Z]/.test(term)
+  const letters = term.replace(/[^A-Za-z]/g, '')
+
+  return letters.length >= 2 && letters === letters.toUpperCase()
 }
 
-/** Matches the term as a whole word, any case unless it is an acronym. */
+/** Matches the term as a whole word: in any case, or in capitals for an acronym. */
 export function termPattern(term: string): RegExp {
   return new RegExp(`(?<![\\w-])${escape(term)}(?![\\w-])`, isAcronym(term) ? '' : 'i')
 }
@@ -51,27 +54,50 @@ export function hasTerm(text: string, term: string): boolean {
 }
 
 /**
- * One pattern for a whole glossary: answers the slugs of the terms a text
- * holds, in the order they appear. Built once per glossary, not per draw.
+ * Two patterns for a whole glossary, one for acronyms (capitals only) and one
+ * for the rest (any case): answers the slugs of the terms a text holds, in
+ * the order they appear, a longer term winning over one inside it. Built once
+ * per glossary, not per draw.
  */
 export function termMatcher(
   entries: ReadonlyArray<readonly [slug: string, term: string]>,
 ): (text: string) => string[] {
-  const bySpelling = new Map<string, { slug: string; term: string }>()
+  const anyCase = new Map<string, string>()
+  const capitals = new Map<string, string>()
   for (const [s, term] of entries) {
-    if (term.trim() !== '') bySpelling.set(term.toLowerCase(), { slug: s, term })
+    if (term.trim() === '') continue
+    if (isAcronym(term)) capitals.set(term, s)
+    else anyCase.set(term.toLowerCase(), s)
   }
-  if (bySpelling.size === 0) return () => []
+  const patternOf = (spellings: Map<string, string>, flags: string) => {
+    if (spellings.size === 0) return null
+    const alternatives = [...spellings.keys()].sort((a, b) => b.length - a.length).map(escape)
 
-  const alternatives = [...bySpelling.keys()].sort((a, b) => b.length - a.length).map(escape)
-  const pattern = new RegExp(`(?<![\\w-])(?:${alternatives.join('|')})(?![\\w-])`, 'gi')
+    return new RegExp(`(?<![\\w-])(?:${alternatives.join('|')})(?![\\w-])`, flags)
+  }
+  const patterns = [
+    { pattern: patternOf(anyCase, 'gi'), slugOf: (m: string) => anyCase.get(m.toLowerCase()) },
+    { pattern: patternOf(capitals, 'g'), slugOf: (m: string) => capitals.get(m) },
+  ]
 
   return text => {
+    const hits: { at: number; end: number; slug: string }[] = []
+    for (const { pattern, slugOf } of patterns) {
+      if (pattern === null) continue
+      for (const m of text.matchAll(pattern)) {
+        const s = slugOf(m[0])
+        const at = m.index ?? 0
+        if (s !== undefined) hits.push({ at, end: at + m[0].length, slug: s })
+      }
+    }
+    hits.sort((a, b) => a.at - b.at || b.end - a.end)
+
     const out = new Set<string>()
-    for (const m of text.matchAll(pattern)) {
-      const entry = bySpelling.get(m[0].toLowerCase())
-      if (entry === undefined || (isAcronym(entry.term) && m[0] !== entry.term)) continue
-      out.add(entry.slug)
+    let reached = 0
+    for (const hit of hits) {
+      if (hit.at < reached) continue
+      reached = hit.end
+      out.add(hit.slug)
     }
 
     return [...out]
@@ -119,16 +145,6 @@ export function proseOf(text: string): string {
 }
 
 /**
- * The distinct words of a reply's prose, lower case, two characters or more
- * (`npm`, `ssh` count), with `C++`, `gRPC`, `node.js` kept whole.
- */
-export function wordsOf(text: string): string[] {
-  const found = proseOf(text).match(/[A-Za-z][A-Za-z0-9+#._-]*[A-Za-z0-9+#]/g) ?? []
-
-  return [...new Set(found.map(w => w.toLowerCase()))]
-}
-
-/**
  * The key a reply's notes sit under: the same for the text as stored and as
  * the terminal draws it, which leaves out `<context>` blocks.
  */
@@ -173,57 +189,6 @@ export function linkTerms(
   return { text: parts.map(p => p.text).join(''), links }
 }
 
-let common: Set<string> | null = null
-
-/** The word and the forms it may be inflected from: "validates" -> "validate". */
-function baseForms(word: string): string[] {
-  const out = [word]
-  const strip = (suffix: string, add = '') => {
-    if (word.endsWith(suffix) && word.length - suffix.length >= 3) {
-      out.push(word.slice(0, -suffix.length) + add)
-    }
-  }
-  strip('ies', 'y')
-  strip('es')
-  strip('s')
-  strip('ed')
-  strip('ed', 'e')
-  strip('d')
-  strip('ing')
-  strip('ing', 'e')
-  const doubled = /(.)\1(?:ed|ing)$/.exec(word)
-  if (doubled !== null) out.push(word.slice(0, doubled.index + 1))
-
-  return out
-}
-
-/** An everyday English word, or an inflection of one (see scripts/common-words.py). */
-function isCommonWord(word: string): boolean {
-  common ??= new Set(COMMON_WORDS.split(' '))
-  const set = common
-
-  return baseForms(word.toLowerCase()).some(w => set.has(w))
-}
-
-const CODE_FILE = /\.(?:jsx?|tsx?|mjs|cjs|py|rb|go|rs|java|kt|swift|json|ya?ml|toml|css|scss|html|sh|lock|md)$/i
-
-/**
- * Whether a term can be jargon at all. Never: one everyday word on its own
- * ("tests", "pass", "validates": it may still head a phrase like "unit
- * test"), a commit hash, or a path. Acronyms and odd spellings (CORS,
- * GraphQL, C++, node.js) always can. Other names from the person's code are
- * left out by `parseExtraction`, which wants a term in the reply's prose.
- */
-export function isJargonCandidate(term: string): boolean {
-  const t = term.trim()
-  if (t === '') return false
-  if (/^[0-9a-f]{7,40}$/i.test(t) && /\d/.test(t)) return false
-  if (t.includes('/') && (/^[.~]/.test(t) || CODE_FILE.test(t) || /\/.*\//.test(t))) return false
-  if (/^[A-Za-z][a-z]+$/.test(t) && isCommonWord(t)) return false
-
-  return true
-}
-
 function clip(value: unknown, max: number): string {
   if (typeof value !== 'string') return ''
   const s = value.replace(/\s+/g, ' ').trim()
@@ -232,15 +197,11 @@ function clip(value: unknown, max: number): string {
 }
 
 /**
- * Reads the model's JSON answer: keeps entries that can be jargon and appear
- * in the prose of `text` (a name seen only in code is the person's own), one
- * per slug, at most MAX_TERMS; `dropped` names the terms past that cap.
- * An answer that is no JSON array (cut off, wrapped in prose) is null.
+ * Reads the model's JSON answer: the first item that carries a definition.
+ * An answer that is no JSON array (cut off, wrapped in prose) or an empty one
+ * is null. The term itself is the caller's: what the person asked about.
  */
-export function parseExtraction(
-  raw: string,
-  text: string,
-): { found: Extracted[]; dropped: string[] } | null {
+export function parseDefinition(raw: string): Definition | null {
   const start = raw.indexOf('[')
   const end = raw.lastIndexOf(']')
   if (start < 0 || end <= start) return null
@@ -253,44 +214,25 @@ export function parseExtraction(
   }
   if (!Array.isArray(data)) return null
 
-  const prose = proseOf(text)
-  const seen = new Set<string>()
-  const out: Extracted[] = []
-  const dropped: string[] = []
   for (const item of data) {
     if (typeof item !== 'object' || item === null) continue
     const o = item as Record<string, unknown>
-    const term = clip(o.term, 60)
     const definition = clip(o.definition, 200)
-    if (!term || !definition || !hasTerm(prose, term) || !isJargonCandidate(term)) continue
-    const s = slug(term)
-    if (seen.has(s)) continue
-    seen.add(s)
-    if (out.length === MAX_TERMS) {
-      dropped.push(term)
-      continue
-    }
-    out.push({
-      slug: s,
-      term,
-      kind: clip(o.kind, 40),
-      definition,
-      context: clip(o.context, 160),
-    })
+    if (!definition) continue
+
+    return { kind: clip(o.kind, 40), definition, context: clip(o.context, 160) }
   }
 
-  return { found: out, dropped }
+  return null
 }
 
-export const EXTRACT_SYSTEM = `You find technical jargon in a coding assistant's reply so a reader can look it up. The reader knows general computing (files, apps, folders, browsers, the internet) but not the software-development trade.
+export const DEFINE_SYSTEM = `You explain one technical term in plain English for a reader who is new to programming.
 
-Answer with a JSON array only, no prose, at most ${MAX_TERMS} items:
-[{"term": "...", "kind": "...", "definition": "...", "context": "..."}]
+Answer with a JSON array holding one item, no prose:
+[{"kind": "...", "definition": "...", "context": "..."}]
 
-- term: copied exactly as it appears in the reply. Only terms whose meaning that reader could not guess from everyday English: specialist concepts, acronyms, and names of tools, protocols, libraries and languages.
-- Skip everyday words even when they are about code: test, pass, fail, validate, check, run, fix, build, change, save, update, error, file, folder, setting, version. Skip names from the person's own project: its files, folders, variables, functions, components, commit hashes and branch names.
 - kind: two or three words naming what it is and its field, like "adjective, APIs" or "tool, version control".
-- definition: plain English, at most 18 words, without using the term itself. Never guess what an acronym stands for.
-- context: at most 16 words on what it means or does in this reply.
+- definition: plain English, at most 18 words, without using the term itself.
+- context: when a reply is given, at most 16 words on what the term means or does in it; otherwise "".
 
-Most replies have little or no jargon: [] is a normal answer, and ${MAX_TERMS} is a limit, not a target.`
+If it is not something you can define, answer [].`

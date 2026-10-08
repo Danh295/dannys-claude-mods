@@ -1,27 +1,26 @@
 import type { JargonGlossary } from '../types'
 
 export const CACHE_VERSION = 1
-export const MAX_SEEN = 50000
 
 /**
- * What `~/.claude/jargon/cache.json` holds: every definition Haiku wrote,
- * every word it has already read, and how many replies it was spared.
+ * What `~/.claude/jargon/cache.json` holds: every definition Haiku wrote, the
+ * slugs the person looked up, and how many times Haiku was asked.
  */
 export type CacheFile = {
   version: typeof CACHE_VERSION
   glossary: JargonGlossary
-  seen: string[]
+  lookedUp: string[]
   asked: number
-  skipped: number
 }
 
 export function emptyCache(): CacheFile {
-  return { version: CACHE_VERSION, glossary: {}, seen: [], asked: 0, skipped: 0 }
+  return { version: CACHE_VERSION, glossary: {}, lookedUp: [], asked: 0 }
 }
 
 /**
  * Reads the file's text, keeping every well-formed entry; null when the text
  * is no JSON object at all (a write cut short), so the caller can keep it.
+ * Fields older versions wrote (`seen`, `skipped`) are dropped.
  */
 export function parseCache(raw: string): CacheFile | null {
   let data: unknown
@@ -46,14 +45,10 @@ export function parseCache(raw: string): CacheFile | null {
       }
     }
   }
-  const seen = Array.isArray(o.seen) ? o.seen.filter((w): w is string => typeof w === 'string') : []
-  const count = (n: unknown) => (typeof n === 'number' && Number.isFinite(n) ? n : 0)
+  const lookedUp = Array.isArray(o.lookedUp)
+    ? o.lookedUp.filter((s): s is string => typeof s === 'string')
+    : []
+  const asked = typeof o.asked === 'number' && Number.isFinite(o.asked) ? o.asked : 0
 
-  return {
-    version: CACHE_VERSION,
-    glossary,
-    seen: seen.slice(-MAX_SEEN),
-    asked: count(o.asked),
-    skipped: count(o.skipped),
-  }
+  return { version: CACHE_VERSION, glossary, lookedUp, asked }
 }

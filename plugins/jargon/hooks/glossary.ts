@@ -21,6 +21,11 @@ export function withoutBundled(glossary: JargonGlossary): JargonGlossary {
   return Object.fromEntries(Object.entries(glossary).filter(([s]) => !(s in BUNDLED)))
 }
 
+/** The lookups that still name a term: a Haiku definition the cap dropped takes its lookup with it. */
+export function liveLookups(slugs: Iterable<string>, glossary: JargonGlossary): string[] {
+  return [...new Set(slugs)].filter(s => s in glossary || s in BUNDLED)
+}
+
 /**
  * The file to write: what is on disk now (another session may have saved
  * since this one read it) with this session's definitions, lookups and calls
@@ -31,11 +36,12 @@ export function merge(
   mine: { glossary: JargonGlossary; lookedUp: readonly string[]; asked: number },
 ): CacheFile {
   const base = disk ?? emptyCache()
+  const glossary = keepLast(withoutBundled({ ...base.glossary, ...mine.glossary }), MAX_GLOSSARY)
 
   return {
     ...emptyCache(),
-    glossary: keepLast(withoutBundled({ ...base.glossary, ...mine.glossary }), MAX_GLOSSARY),
-    lookedUp: [...new Set([...base.lookedUp, ...mine.lookedUp])].slice(-MAX_GLOSSARY),
+    glossary,
+    lookedUp: liveLookups([...base.lookedUp, ...mine.lookedUp], glossary),
     asked: base.asked + mine.asked,
   }
 }

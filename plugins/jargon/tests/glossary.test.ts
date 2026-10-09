@@ -2,7 +2,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { emptyCache } from '../hooks/cache'
 import type { CacheFile } from '../hooks/cache'
-import { MAX_GLOSSARY, merge, withoutBundled } from '../hooks/glossary'
+import { MAX_GLOSSARY, liveLookups, merge, withoutBundled } from '../hooks/glossary'
 
 function entry(term: string) {
   return { term, kind: 'k', definition: `about ${term}` }
@@ -21,7 +21,7 @@ describe('glossary', () => {
     const disk: CacheFile = {
       ...emptyCache(),
       glossary: glossaryOf('semaphore', 'k8s', 'mutex'),
-      lookedUp: ['semaphore', 'api'],
+      lookedUp: ['semaphore', 'api', 'gone'],
       asked: 5,
     }
     const file = merge(disk, {
@@ -33,6 +33,13 @@ describe('glossary', () => {
     expect(file.glossary.semaphore?.definition).toBe('mine')
     expect(file.lookedUp).toEqual(['semaphore', 'api', 'flux'])
     expect(file.asked).toBe(6)
+  })
+
+  test('a lookup goes with the definition it named', async () => {
+    expect(liveLookups(['flux', 'api', 'gone', 'flux'], glossaryOf('flux'))).toEqual(['flux', 'api'])
+    const many = Array.from({ length: MAX_GLOSSARY + 1 }, (_, i) => `zterm${i}`)
+    const file = merge(null, { glossary: glossaryOf(...many), lookedUp: ['zterm0', 'zterm1'], asked: 0 })
+    expect(file.lookedUp).toEqual(['zterm1'])
   })
 
   test('with no file, a save is this session alone', async () => {

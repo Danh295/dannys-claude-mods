@@ -2,6 +2,11 @@ export const LINK_ROOT = 'https://jargon.invalid/'
 /** Drawn after each linked term, inside the link, so the mark presses with the word. */
 export const MARK = 'ⓘ'
 
+/** The longest term `/jargon <term>` takes, as the old extraction clipped terms. */
+export const MAX_TERM_CHARS = 60
+/** How much of a reply goes to Haiku as context, around the term. */
+export const MAX_EXCERPT_CHARS = 1200
+
 /** What Haiku answers for one term: the entry's text and how the reply uses it. */
 export type Definition = { kind: string; definition: string; context: string }
 
@@ -134,6 +139,33 @@ function segments(text: string): Segment[] {
   if (at < text.length) out.push({ text: text.slice(at), isProse: true })
 
   return out
+}
+
+/**
+ * What the person typed after `/jargon`, as a term: wrapping quotes,
+ * backticks and emphasis taken off, spaces collapsed.
+ */
+export function cleanTerm(raw: string): string {
+  let t = raw.trim().replace(/\s+/g, ' ')
+  for (;;) {
+    const m = /^(["'`*_]+)(.*?)\1$/.exec(t)
+    if (m === null || m[2]!.trim() === '') return t
+    t = m[2]!.trim()
+  }
+}
+
+/**
+ * The part of a reply Haiku needs to see a term in use: the reply whole when
+ * short, else MAX_EXCERPT_CHARS around the term's first mention.
+ */
+export function excerpt(reply: string, term: string): string {
+  const text = reply.replace(/<context>[\s\S]*?<\/context>/g, '').trim()
+  if (text.length <= MAX_EXCERPT_CHARS) return text
+  const at = termPattern(term).exec(text)?.index ?? 0
+  const start = Math.max(0, Math.min(at - MAX_EXCERPT_CHARS / 2, text.length - MAX_EXCERPT_CHARS))
+  const cut = text.slice(start, start + MAX_EXCERPT_CHARS)
+
+  return `${start > 0 ? '…' : ''}${cut}${start + MAX_EXCERPT_CHARS < text.length ? '…' : ''}`
 }
 
 /** The text with code and links taken out: what a reader reads as prose. */

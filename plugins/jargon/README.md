@@ -9,7 +9,7 @@ jargon ships with about 190 common dev terms (idempotent, mutex, race condition,
 
 ## Commands
 
-- `/jargon <term>`: show a term's card. A term jargon doesn't know yet costs one small Haiku call, using the newest reply that mentions it for context. With highlights off, the definition is printed instead.
+- `/jargon <term>`: show a term's card. A term jargon doesn't know yet costs one small Haiku call, sent with the part of the newest reply that mentions it. Quotes and backticks around the term are dropped; a term is at most 60 characters. With highlights off, the definition is printed instead.
 - `/jargon level beginner|intermediate|advanced`: how much you already know. Each built-in term is tagged basic, intermediate or advanced:
   - **beginner** highlights all of them;
   - **intermediate** (the default) skips the basic ones, like API, git and JSON;
@@ -25,4 +25,4 @@ Acronyms (REST, PR, CI) are only linked when written in capitals, so "the rest o
 
 ## Cost and storage
 
-Highlighting costs nothing: jargon only calls Haiku when you look up a term it doesn't know. Built-in terms live in `hooks/bundled.ts`; the terms Haiku defined for you, and the ones you looked up, are kept in `~/.claude/jargon/cache.json`. Each save merges with what is already in the file, so sessions open side by side keep each other's terms.
+Highlighting costs nothing: jargon only calls Haiku when you look up a term it doesn't know. Built-in terms live in `hooks/bundled.ts`; the terms Haiku defined for you, and the ones you looked up, are kept in `~/.claude/jargon/cache.json`. Definitions an older version saved by itself stay there unhighlighted until you look one up, which then costs nothing. Each save merges with what is already in the file, so sessions open side by side keep each other's terms.

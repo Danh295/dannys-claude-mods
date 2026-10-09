@@ -5,7 +5,7 @@ Mods for [Claude Code](https://claude.com/claude-code): small plugins that add p
 | Mod | What it does |
 | --- | --- |
 | [jot](plugins/jot) | A notes pane. Jot things down during a session, keep them across sessions, and paste one into the prompt with a keystroke. |
-| [jargon](plugins/jargon) | Highlights jargon in Claude's replies. Hover a term for a plain-English definition; click it to pin the card above the prompt. |
+| [jargon](plugins/jargon) | Highlights jargon in Claude's replies: about 190 built-in terms filtered by your level, and `/jargon <term>` for any other. Hover a term for a plain-English definition; click it to pin the card above the prompt. |
 
 ## Install
 

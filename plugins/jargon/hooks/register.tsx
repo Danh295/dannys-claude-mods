@@ -6,10 +6,13 @@ import { BUNDLED, DEFAULT_LEVEL, LEVELS, bundledFor, isLevel } from './bundled'
 import { emptyCache, parseCache } from './cache'
 import type { CacheFile } from './cache'
 import { card, cardLeft, cardWidth, chipOffsets } from './card'
-import { MAX_GLOSSARY, MAX_REPLIES, keepLast, merge, withoutBundled } from './glossary'
+import { MAX_GLOSSARY, MAX_REPLIES, keepLast, liveLookups, merge, withoutBundled } from './glossary'
 import {
   DEFINE_SYSTEM,
   LINK_ROOT,
+  MAX_TERM_CHARS,
+  cleanTerm,
+  excerpt,
   hasTerm,
   linkTerms,
   parseDefinition,
@@ -30,6 +33,7 @@ const STORE_KEY = 'glossary'
 const BACKUP_KEY = 'cache'
 const LEVEL_KEY = 'level'
 const MAX_RECENT = 20
+const MAX_RETIRED = 500
 const MAX_TERMS = 8
 
 type Term = JargonEntry & { slug: string }
@@ -44,27 +48,29 @@ let asked = 0
 let cachePath = ''
 let writing: Promise<void> = Promise.resolve()
 
-// One combined pattern per glossary version, and each reply's terms under it.
-let matcher: { version: string; find: (text: string) => string[] } | null = null
+// Bumped after every write to what decides the highlights (the glossary, the
+// lookups, the level), so the pattern and the memos below never go stale. Each
+// write names its atom at the call, as the engine's scan requires, so the bump
+// follows each one.
+let termsVersion = 0
+
+// One combined pattern per terms version, and each reply's terms under it.
+let matcher: { version: number; find: (text: string) => string[] } | null = null
 
 // The transcript's width beside a docked pane, as the band last measured it
 // (its body plus the engine's five for `[-]`); `viewport.columns` is the whole
 // screen's. A render hook may not write state, so the band leaves it here.
 let transcriptColumns: number | undefined
 
-// The replies in the order they were first drawn, newest last: where
-// `/jargon <term>` finds the reply a term came from. Kept here for the same
-// reason; a reload losing it costs only that context.
-let recent: string[] = []
+// The replies in the order they were first drawn, newest last, by message
+// id: where `/jargon <term>` finds the reply a term came from. Kept here for
+// the same reason; a reload losing it costs only that context. `retired`
+// holds the ids that left the list, so an old reply redrawn stays out.
+let recent: { id: string; text: string }[] = []
+let retired = new Set<string>()
 
-// The glossary replies are matched against, as last built, and what it was
-// built from: rebuilt only when the level, the glossary or the lookups change.
-let visible: {
-  level: JargonLevel
-  defined: JargonGlossary
-  looked: readonly string[]
-  terms: JargonGlossary
-} | null = null
+// The glossary replies are matched against, as built for `termsVersion`.
+let visible: { version: number; terms: JargonGlossary } | null = null
 
 const CHIP_LEAD = 'Terms'.length
 const CHIP_GAP = 2
@@ -91,8 +97,14 @@ function save($: EngineInterface): Promise<void> {
       await $.store.set(BACKUP_KEY, file)
       if (cachePath) await $.fs.write(cachePath, JSON.stringify(file, null, 2))
       // Take in what other sessions saved, keeping what this one found meanwhile.
-      await update($, glossary, now => keepLast({ ...file.glossary, ...now }, MAX_GLOSSARY))
-      await update($, lookedUp, now => [...new Set([...file.lookedUp, ...now])].slice(-MAX_GLOSSARY))
+      let defined: JargonGlossary = {}
+      await update($, glossary, now => {
+        defined = keepLast(withoutBundled({ ...file.glossary, ...now }), MAX_GLOSSARY)
+        return defined
+      })
+      termsVersion += 1
+      await update($, lookedUp, now => liveLookups([...file.lookedUp, ...now], defined))
+      termsVersion += 1
       saved = file.asked
       asked -= sent
     })
@@ -147,10 +159,9 @@ function termsFor(
   looked: readonly string[],
   own: Record<string, string>,
 ): Term[] {
-  const slugs = Object.keys(known)
-  const version = `${slugs.length}:${slugs[slugs.length - 1] ?? ''}:${looked.length}`
-  if (matcher?.version !== version) {
-    matcher = { version, find: termMatcher(slugs.map(s => [s, known[s]?.term ?? ''])) }
+  if (matcher?.version !== termsVersion) {
+    const slugs = Object.keys(known)
+    matcher = { version: termsVersion, find: termMatcher(slugs.map(s => [s, known[s]?.term ?? ''])) }
     termsMemo.clear()
   }
   const memoKey = `${replyKey(text)}:${Object.keys(own).join(',')}`
@@ -164,13 +175,16 @@ function termsFor(
   const add = (s: string) => {
     const entry = known[s]
     if (entry === undefined || taken.has(s) || out.length >= MAX_TERMS) return
-    if (!hasTerm(prose, entry.term)) return
     taken.add(s)
     out.push({ ...entry, slug: s })
   }
   const found = matcher.find(prose)
   const isLooked = new Set(looked)
-  for (const s of Object.keys(own)) add(s)
+  // The matcher found `found` in the prose already; only the reply's own notes need checking.
+  for (const s of Object.keys(own)) {
+    const entry = known[s]
+    if (entry !== undefined && hasTerm(prose, entry.term)) add(s)
+  }
   for (const s of found) if (isLooked.has(s)) add(s)
   for (const s of found) add(s)
 
@@ -180,37 +194,49 @@ function termsFor(
   return out
 }
 
-/** What highlights at `lvl`: its bundled terms, any bundled one looked up, and every defined one. */
+/**
+ * What highlights at `lvl`: the bundled terms it shows, and every term the
+ * person looked up, bundled or Haiku's. Other saved definitions (0.1.x
+ * picked them by itself) stay out of sight but answer a lookup for free.
+ */
 function visibleTerms(lvl: JargonLevel, defined: JargonGlossary, looked: readonly string[]): JargonGlossary {
-  if (visible?.level === lvl && visible.defined === defined && visible.looked === looked) {
-    return visible.terms
-  }
+  if (visible?.version === termsVersion) return visible.terms
   const terms: JargonGlossary = { ...bundledFor(lvl) }
   for (const s of looked) {
-    const entry = BUNDLED[s]
+    const entry = defined[s] ?? BUNDLED[s]
     if (entry !== undefined) terms[s] = entry
   }
-  Object.assign(terms, defined)
-  visible = { level: lvl, defined, looked, terms }
+  visible = { version: termsVersion, terms }
 
   return terms
 }
 
-function remember(text: string): void {
-  if (recent.includes(text)) return
-  const last = recent[recent.length - 1]
-  // A reply drawn while it streams grows: keep its latest text, not each step.
-  if (last !== undefined && text.startsWith(last)) {
-    recent = [...recent.slice(0, -1), text]
+/**
+ * Notes a reply as drawn. A reply that streams redraws under its id with
+ * longer text, which replaces what was kept; a redraw of one that has left
+ * the list adds nothing.
+ */
+function remember(id: string, text: string): void {
+  const mine = recent.filter(r => r.id === id)
+  if (mine.some(r => r.text.startsWith(text))) return
+  const grown = recent.findIndex(r => r.id === id && text.startsWith(r.text))
+  if (grown >= 0) {
+    recent = recent.map((r, i) => (i === grown ? { id, text } : r))
     return
   }
-  recent = [...recent, text].slice(-MAX_RECENT)
+  if (mine.length === 0 && retired.has(id)) return
+  recent = [...recent, { id, text }]
+  while (recent.length > MAX_RECENT) {
+    retired.add(recent[0]!.id)
+    recent = recent.slice(1)
+  }
+  if (retired.size > MAX_RETIRED) retired = new Set([...retired].slice(-MAX_RETIRED))
 }
 
 /** The newest reply that holds `term`, if any. */
 function replyWith(term: string): string | undefined {
   for (let i = recent.length - 1; i >= 0; i--) {
-    if (hasTerm(recent[i]!, term)) return recent[i]
+    if (hasTerm(recent[i]!.text, term)) return recent[i]!.text
   }
 
   return undefined
@@ -218,7 +244,8 @@ function replyWith(term: string): string | undefined {
 
 /** Records a lookup: the term then highlights at every level, ranked first. */
 async function markLookedUp($: EngineInterface, s: string): Promise<void> {
-  await update($, lookedUp, list => (list.includes(s) ? list : [...list, s].slice(-MAX_GLOSSARY)))
+  await update($, lookedUp, list => (list.includes(s) ? list : [...list, s]))
+  termsVersion += 1
   await save($)
 }
 
@@ -251,7 +278,7 @@ async function define($: EngineInterface, term: string): Promise<string> {
     maxTokens: 400,
     timeoutMs: 20000,
     system: DEFINE_SYSTEM,
-    prompt: reply === undefined ? `Define: ${term}` : `<reply>\n${reply}\n</reply>\n\nDefine: ${term}`,
+    prompt: reply === undefined ? `Define: ${term}` : `<reply>\n${excerpt(reply, term)}\n</reply>\n\nDefine: ${term}`,
   })
   if (!result.isAnswered) {
     debug($, `Haiku gave no answer (${result.reason})`)
@@ -277,6 +304,7 @@ async function define($: EngineInterface, term: string): Promise<string> {
 
     return keepLast(next, MAX_GLOSSARY)
   })
+  termsVersion += 1
   if (reply !== undefined && found.context !== '') {
     await update($, notes, all => {
       const next = { ...all }
@@ -308,14 +336,24 @@ export const register: Register = on => {
     // entry and its tier take over, so the level applies to them.
     const own = withoutBundled(cache.glossary)
     const dropped = Object.keys(cache.glossary).length - Object.keys(own).length
-    await update($, glossary, known => ({ ...own, ...known }))
-    await update($, lookedUp, list => [...new Set([...cache.lookedUp, ...list])])
+    // A reload keeps the atoms, which a 0.1.x module may have filled: clean them too.
+    let defined: JargonGlossary = {}
+    await update($, glossary, known => {
+      defined = withoutBundled({ ...own, ...known })
+      return defined
+    })
+    termsVersion += 1
+    await update($, lookedUp, list => liveLookups([...cache.lookedUp, ...list], defined))
+    termsVersion += 1
     if (dropped > 0) {
       debug($, `dropped ${dropped} saved terms that are built in`)
       await save($)
     }
     const kept = await $.store.get(LEVEL_KEY)
-    if (isLevel(kept)) await update($, level, () => kept)
+    if (isLevel(kept)) {
+      await update($, level, () => kept)
+      termsVersion += 1
+    }
     await $.command.register({
       name: 'jargon',
       description: 'Jargon highlights: define a term, set your level, turn them on or off, or list the terms Haiku defined',
@@ -338,6 +376,7 @@ export const register: Register = on => {
       }
       if (!isLevel(name)) return { text: `No level "${name}". Levels: ${LEVELS.join(', ')}.` }
       await update($, level, () => name)
+      termsVersion += 1
       await $.store.set(LEVEL_KEY, name)
 
       return { text: `Level: ${name}. ${Object.keys(bundledFor(name)).length} built-in terms highlight.` }
@@ -348,7 +387,14 @@ export const register: Register = on => {
 
       return { text: word === 'on' ? 'Jargon highlights on.' : 'Jargon highlights off.' }
     }
-    if (arg !== '') return { text: await define($, arg) }
+    if (arg !== '') {
+      const term = cleanTerm(arg)
+      if (term.length > MAX_TERM_CHARS) {
+        return { text: `That's longer than a term: ${MAX_TERM_CHARS} characters at most.` }
+      }
+
+      return { text: await define($, term) }
+    }
 
     const current = await read($, level)
     const builtIn =
@@ -371,7 +417,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
     if (e.props.isSummary) return next(e)
     const text = e.props.text
-    remember(text)
+    remember(e.requestId, text)
     if (!(await read($, isOn))) return next(e)
 
     const key = replyKey(text)

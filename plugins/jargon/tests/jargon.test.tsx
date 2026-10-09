@@ -5,7 +5,19 @@ import type { Engine } from 'claude-code/testing'
 import { BUNDLED, LEVELS, TIERS, bundledFor, isLevel } from '../hooks/bundled'
 import { emptyCache, parseCache } from '../hooks/cache'
 import { cardLeft, cellWidth, chipOffsets } from '../hooks/card'
-import { hasTerm, hash, isAcronym, linkTerms, parseDefinition, replyKey, slug, termMatcher } from '../hooks/text'
+import {
+  MAX_EXCERPT_CHARS,
+  cleanTerm,
+  excerpt,
+  hasTerm,
+  hash,
+  isAcronym,
+  linkTerms,
+  parseDefinition,
+  replyKey,
+  slug,
+  termMatcher,
+} from '../hooks/text'
 
 const REPLY =
   'Make the webhook handler idempotent so a retry from Stripe cannot charge twice. ' +
@@ -75,6 +87,23 @@ describe('text helpers', () => {
     expect(parseDefinition('no json here')).toBeNull()
     expect(parseDefinition('[{"definition": "A lo')).toBeNull()
     expect(parseDefinition('[]')).toBeNull()
+  })
+
+  test('a typed term loses its wrapping quotes, backticks and emphasis', async () => {
+    expect(cleanTerm('`useEffect`')).toBe('useEffect')
+    expect(cleanTerm('"race   condition"')).toBe('race condition')
+    expect(cleanTerm("**'mutex'**")).toBe('mutex')
+    expect(cleanTerm('C++')).toBe('C++')
+    expect(cleanTerm('``')).toBe('``')
+  })
+
+  test('an excerpt is the reply whole when short, else the part around the term', async () => {
+    expect(excerpt('Use a mutex. <context>hidden</context>', 'mutex')).toBe('Use a mutex.')
+    const long = 'a '.repeat(2000) + 'the zork here ' + 'b '.repeat(2000)
+    const cut = excerpt(long, 'zork')
+    expect(cut).toContain('the zork here')
+    expect(cut.length).toBeLessThanOrEqual(MAX_EXCERPT_CHARS + 2)
+    expect(excerpt('zork ' + 'c '.repeat(2000), 'zork').startsWith('zork')).toBe(true)
   })
 
   test('acronyms match only in capitals; other terms in any case', async () => {
@@ -275,17 +304,19 @@ test('replies with no known terms draw as the engine draws them', async ($, on) 
 
     return <Text>engine's own</Text>
   })
-  const ui = await $.ui.mount({
-    plugin: 'jargon',
-    surface: 'terminal',
-    component: 'AssistantMessage',
-    requestId: 'm2',
-    viewport: { columns: 100, rows: 40 },
-    props: { text: 'Done. ' + hash('x'), isFirstOfReply: true },
-  })
-  expect(await ui.find({ type: 'Markdown', key: 'reply' })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: /engine's own/ })).toBeDefined()
-  await ui.unmount()
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({
+      plugin: 'jargon',
+      surface,
+      component: 'AssistantMessage',
+      requestId: 'm2',
+      viewport: { columns: 100, rows: 40 },
+      props: { text: 'Done. ' + hash('x'), isFirstOfReply: true },
+    })
+    expect(await ui.find({ type: 'Markdown', key: 'reply' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /engine's own/ })).toBeDefined()
+    await ui.unmount()
+  }
 })
 
 test('on a narrow screen each card opens leftwards to stay on screen', async ($, on) => {
@@ -334,7 +365,16 @@ const BAND_PROPS = {
 type Asked = { system?: string; prompt: string }
 
 /** A fresh session: an empty store and cache, Haiku answering `answer`. */
-async function lookupWorld($: Engine, on: On, answer: () => unknown, store: Record<string, unknown> = {}) {
+const SURFACES = ['terminal', 'desktop'] as const
+type Surface = (typeof SURFACES)[number]
+
+async function lookupWorld(
+  $: Engine,
+  on: On,
+  answer: () => unknown,
+  store: Record<string, unknown> = {},
+  before: () => Promise<unknown> = async () => undefined,
+) {
   const asked: Asked[] = []
   const writes: { path: string; text: string }[] = []
   mock.store(on, store)
@@ -355,6 +395,7 @@ async function lookupWorld($: Engine, on: On, answer: () => unknown, store: Reco
 
     return <Text>engine's own</Text>
   })
+  await before()
   await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
 
   return { asked, writes }
@@ -460,56 +501,55 @@ test('/jargon <term> says so when Haiku gives no definition', async ($, on) => {
   expect(out.text).toBe("Couldn't define semaphore.")
   expect(w.asked.length).toBe(1)
 
-  const band = await $.ui.mount({
-    plugin: 'jargon',
-    surface: 'terminal',
-    component: 'AbovePrompt',
-    requestId: 'band',
-    viewport: { columns: 100, rows: 40 },
-    props: BAND_PROPS,
-  })
-  expect(await band.find({ type: 'Text', text: /engine's own/ })).toBeDefined()
-  await band.unmount()
+  for (const surface of SURFACES) {
+    const band = await mountBand($, surface)
+    expect(await band.find({ type: 'Text', text: /engine's own/ })).toBeDefined()
+    await band.unmount()
+  }
 })
 
 test('a looked-up term still shows when common bundled terms come first', async ($, on) => {
-  mock.store(on, {
+  await lookupWorld($, on, NO_ANSWER, {
     glossary: { semaphore: { term: 'semaphore', kind: 'noun', definition: 'A counter of free slots.' } },
   })
-  mock.env(on, { HOME: '/tmp/jargon-test' })
-  on('fs.exists', () => ({ value: false }))
-  on('command.register', ($, e) => ({ value: { command: e.name } }))
-  on('session.start', ($, e) => ({ cwd: e.cwd }))
-  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
   // Beginner shows the common words that would crowd the reply.
   await $.command.run({ command: 'jargon', args: 'level beginner' } as never)
   await $.command.run({ command: 'jargon', args: 'semaphore' } as never)
 
-  const text =
-    'Commit the diff to the repo, open a PR, and let CI run the npm lint step; ' +
-    'the API returns JSON over HTTP, and a semaphore caps the workers.'
-  const ui = await $.ui.mount({
-    plugin: 'jargon',
-    surface: 'terminal',
-    component: 'AssistantMessage',
-    requestId: 'crowd',
-    viewport: { columns: 100, rows: 40 },
-    props: { text, isFirstOfReply: true },
-  })
-  expect(await ui.find({ type: 'Button', key: 'chip-semaphore' })).toBeDefined()
-  expect(await ui.find({ type: 'Button', key: 'chip-http' })).toBeUndefined()
-  await ui.unmount()
+  for (const surface of SURFACES) {
+    const ui = await mountReply($, CROWD, 'crowd', surface)
+    expect(await chipsOf(ui, ['semaphore', 'http'])).toEqual([
+      ['semaphore', true],
+      ['http', false],
+    ])
+    await ui.unmount()
+  }
 })
 
-test('the level picks which bundled terms show; Haiku-defined terms always do', async ($, on) => {
-  mock.store(on, {
-    glossary: { semaphore: { term: 'semaphore', kind: 'noun', definition: 'A counter of free slots.' } },
+test('a lookup re-ranks a reply already drawn', async ($, on) => {
+  await lookupWorld($, on, NO_ANSWER)
+  await $.command.run({ command: 'jargon', args: 'level beginner' } as never)
+
+  for (const surface of SURFACES) {
+    const ui = await mountReply($, CROWD, `rerank-${surface}`, surface)
+    if (surface === 'terminal') {
+      expect(await chipsOf(ui, ['http'])).toEqual([['http', false]])
+      await $.command.run({ command: 'jargon', args: 'HTTP' } as never)
+    }
+    expect(await chipsOf(ui, ['http'])).toEqual([['http', true]])
+    await ui.unmount()
+  }
+})
+
+test('the level picks which bundled terms show; looked-up terms always do', async ($, on) => {
+  const w = await lookupWorld($, on, NO_ANSWER, {
+    glossary: {
+      semaphore: { term: 'semaphore', kind: 'noun', definition: 'A counter of free slots.' },
+      flux: { term: 'flux', kind: 'noun', definition: 'Picked by 0.1.x, never looked up.' },
+    },
   })
-  mock.env(on, { HOME: '/tmp/jargon-test' })
-  on('fs.exists', () => ({ value: false }))
-  on('command.register', ($, e) => ({ value: { command: e.name } }))
-  on('session.start', ($, e) => ({ cwd: e.cwd }))
-  await $.session.start({ cwd: '/tmp', surface: 'terminal', isInteractive: true })
+  await $.command.run({ command: 'jargon', args: 'semaphore' } as never)
+  expect(w.asked).toEqual([])
 
   const level = await $.command.run({ command: 'jargon', args: 'level' } as never)
   expect(level.text).toContain('Level: intermediate.')
@@ -521,24 +561,17 @@ test('the level picks which bundled terms show; Haiku-defined terms always do', 
     intermediate: ['webhook', 'idempotent', 'semaphore'],
     advanced: ['idempotent', 'semaphore'],
   } as const
-  const text = 'Call the API from the webhook, keep it idempotent, and guard the pool with a semaphore.'
+  const text = 'Call the API from the webhook, keep it idempotent, and guard the flux with a semaphore.'
+  const slugs = ['api', 'webhook', 'idempotent', 'semaphore', 'flux']
 
-  for (const surface of ['terminal', 'desktop'] as const) {
-    const ui = await $.ui.mount({
-      plugin: 'jargon',
-      surface,
-      component: 'AssistantMessage',
-      requestId: `level-${surface}`,
-      viewport: { columns: 100, rows: 40 },
-      props: { text, isFirstOfReply: true },
-    })
+  for (const surface of SURFACES) {
+    const ui = await mountReply($, text, `level-${surface}`, surface)
     for (const name of LEVELS) {
       const out = await $.command.run({ command: 'jargon', args: `level ${name}` } as never)
       expect(out.text).toContain(`Level: ${name}.`)
-      for (const s of ['api', 'webhook', 'idempotent', 'semaphore']) {
-        const chip = await ui.find({ type: 'Button', key: `chip-${s}` })
-        expect([s, chip !== undefined]).toEqual([s, (shown[name] as readonly string[]).includes(s)])
-      }
+      expect(await chipsOf(ui, slugs)).toEqual(
+        slugs.map(s => [s, (shown[name] as readonly string[]).includes(s)] as const),
+      )
     }
     await ui.unmount()
   }
@@ -572,6 +605,9 @@ const answering = (definition: string) => () => ({
   text: JSON.stringify([{ term: 'Something else', kind: 'noun', definition, context: '' }]),
   usage: { inputTokens: 1, outputTokens: 1 },
 })
+const CROWD =
+  'Commit the diff to the repo, open a PR, and let CI run the npm lint step; ' +
+  'the API returns JSON over HTTP, and a semaphore caps the workers.'
 
 function chipsOf(ui: { find: (q: never) => Promise<unknown> }, slugs: readonly string[]) {
   return Promise.all(
@@ -579,10 +615,10 @@ function chipsOf(ui: { find: (q: never) => Promise<unknown> }, slugs: readonly s
   )
 }
 
-async function mountReply($: Engine, text: string, requestId: string) {
+async function mountReply($: Engine, text: string, requestId: string, surface: Surface = 'terminal') {
   return $.ui.mount({
     plugin: 'jargon',
-    surface: 'terminal',
+    surface,
     component: 'AssistantMessage',
     requestId,
     viewport: { columns: 100, rows: 40 },
@@ -590,7 +626,22 @@ async function mountReply($: Engine, text: string, requestId: string) {
   })
 }
 
-test('a 0.1.0 cache: its picks of built-in terms follow the level and leave the file', async ($, on) => {
+async function mountBand($: Engine, surface: Surface) {
+  return $.ui.mount({
+    plugin: 'jargon',
+    surface,
+    component: 'AbovePrompt',
+    requestId: `band-${surface}`,
+    viewport: { columns: 100, rows: 40 },
+    props: BAND_PROPS,
+  })
+}
+
+function lastFile(w: { writes: { path: string; text: string }[] }) {
+  return JSON.parse(w.writes.filter(x => x.path === CACHE_PATH).at(-1)?.text ?? '{}')
+}
+
+test('a 0.1.x cache: built-in picks leave the file; other picks wait for a lookup', async ($, on) => {
   const old = {
     version: 1,
     glossary: {
@@ -602,35 +653,79 @@ test('a 0.1.0 cache: its picks of built-in terms follow the level and leave the 
     skipped: 9,
   }
   const w = await lookupWorld($, on, NO_ANSWER, { cache: old })
-  const ui = await mountReply($, 'Call the API and watch the flux.', 'old')
-  expect(await chipsOf(ui, ['api', 'flux'])).toEqual([
-    ['api', false],
-    ['flux', true],
-  ])
-  await ui.unmount()
+  for (const surface of SURFACES) {
+    const ui = await mountReply($, 'Call the API and watch the flux.', 'old', surface)
+    expect(await chipsOf(ui, ['api', 'flux'])).toEqual([
+      ['api', false],
+      ['flux', false],
+    ])
+    await ui.unmount()
+  }
 
-  await $.command.run({ command: 'jargon', args: 'flux' } as never)
-  const file = JSON.parse(w.writes.filter(x => x.path === CACHE_PATH).at(-1)?.text ?? '{}')
+  // Its saved definition answers the lookup for free, and from then on it shows.
+  expect((await $.command.run({ command: 'jargon', args: 'flux' } as never)).text).toBe('Pinned flux.')
+  for (const surface of SURFACES) {
+    const ui = await mountReply($, 'Watch the flux again.', 'again', surface)
+    expect(await chipsOf(ui, ['flux'])).toEqual([['flux', true]])
+    await ui.unmount()
+  }
+  const file = lastFile(w)
   expect(Object.keys(file.glossary)).toEqual(['flux'])
   expect(file.lookedUp).toEqual(['flux'])
   expect(file.asked).toBe(3)
   expect(w.asked).toEqual([])
 })
 
+test('a reload over a 0.1.x module cleans its built-in picks from the atoms too', async ($, on) => {
+  const old = { api: { term: 'API', kind: 'noun', definition: 'An old definition.' } }
+  // The atoms a 0.1.x module left behind: its first glossary read answers with them.
+  let leftOver = true
+  on('state.get', ($, e, next) => {
+    const at = e as { plugin: string; key: string }
+    if (leftOver && at.plugin === 'jargon' && at.key === 'glossary') {
+      leftOver = false
+      return { value: { value: old, version: 0 } } as never
+    }
+    return next(e)
+  })
+  await lookupWorld($, on, NO_ANSWER)
+  expect(leftOver).toBe(false)
+  const list = await $.command.run({ command: 'jargon', args: '' } as never)
+  expect(list.text).not.toContain('old definition')
+  await $.command.run({ command: 'jargon', args: 'level advanced' } as never)
+  for (const surface of SURFACES) {
+    const ui = await mountReply($, 'Call the API.', `reload-${surface}`, surface)
+    expect(await chipsOf(ui, ['api'])).toEqual([['api', false]])
+    await ui.unmount()
+  }
+
+  await $.command.run({ command: 'jargon', args: 'API' } as never)
+  for (const surface of SURFACES) {
+    const band = await mountBand($, surface)
+    expect(await band.find({ type: 'Text', text: /one program to ask another/ })).toBeDefined()
+    expect(await band.find({ type: 'Text', text: /old definition/ })).toBeUndefined()
+    await band.unmount()
+  }
+})
+
 test('a built-in term looked up highlights at any level', async ($, on) => {
   const w = await lookupWorld($, on, NO_ANSWER)
   await $.command.run({ command: 'jargon', args: 'level advanced' } as never)
-  const before = await mountReply($, 'Call the API.', 'before')
-  expect(await chipsOf(before, ['api'])).toEqual([['api', false]])
-  await before.unmount()
+  for (const surface of SURFACES) {
+    const before = await mountReply($, 'Call the API.', `before-${surface}`, surface)
+    expect(await chipsOf(before, ['api'])).toEqual([['api', false]])
+    await before.unmount()
+  }
 
   const out = await $.command.run({ command: 'jargon', args: 'API' } as never)
   expect(out.text).toBe('Pinned API.')
-  const after = await mountReply($, 'Call the API again.', 'after')
-  expect(await chipsOf(after, ['api'])).toEqual([['api', true]])
-  await after.unmount()
+  for (const surface of SURFACES) {
+    const after = await mountReply($, 'Call the API again.', `after-${surface}`, surface)
+    expect(await chipsOf(after, ['api'])).toEqual([['api', true]])
+    await after.unmount()
+  }
 
-  const file = JSON.parse(w.writes.filter(x => x.path === CACHE_PATH).at(-1)?.text ?? '{}')
+  const file = lastFile(w)
   expect(file.lookedUp).toEqual(['api'])
   expect(file.glossary).toEqual({})
   expect(w.asked).toEqual([])
@@ -642,20 +737,31 @@ test('Haiku naming the term differently still defines what was asked', async ($,
   expect(out.text).toBe('Defined k8s.')
   expect(w.asked.map(a => a.prompt)).toEqual(['Define: k8s'])
 
-  const band = await $.ui.mount({
-    plugin: 'jargon',
-    surface: 'terminal',
-    component: 'AbovePrompt',
-    requestId: 'band',
-    viewport: { columns: 100, rows: 40 },
-    props: BAND_PROPS,
-  })
-  expect(await band.find({ type: 'Text', text: /across many machines/ })).toBeDefined()
-  await band.unmount()
+  for (const surface of SURFACES) {
+    const band = await mountBand($, surface)
+    expect(await band.find({ type: 'Text', text: /across many machines/ })).toBeDefined()
+    await band.unmount()
 
-  const ui = await mountReply($, 'Deploy it to k8s tonight.', 'k8s')
-  expect(await chipsOf(ui, ['k8s'])).toEqual([['k8s', true]])
-  await ui.unmount()
+    const ui = await mountReply($, 'Deploy it to k8s tonight.', 'k8s', surface)
+    expect(await chipsOf(ui, ['k8s'])).toEqual([['k8s', true]])
+    await ui.unmount()
+  }
+})
+
+test('a term is taken without its quotes or backticks, and not past 60 characters', async ($, on) => {
+  const w = await lookupWorld($, on, answering('Runs code after the component draws.'))
+  const out = await $.command.run({ command: 'jargon', args: '`useEffect`' } as never)
+  expect(out.text).toBe('Defined useEffect.')
+  expect(w.asked.map(a => a.prompt)).toEqual(['Define: useEffect'])
+  for (const surface of SURFACES) {
+    const ui = await mountReply($, 'Call useEffect after the first render.', 'hook', surface)
+    expect(await chipsOf(ui, ['useeffect'])).toEqual([['useeffect', true]])
+    await ui.unmount()
+  }
+
+  const long = await $.command.run({ command: 'jargon', args: 'x'.repeat(61) } as never)
+  expect(long.text).toBe("That's longer than a term: 60 characters at most.")
+  expect(w.asked.length).toBe(1)
 })
 
 test('/jargon level <one word> is the setting; a longer phrase is a term', async ($, on) => {
@@ -673,7 +779,7 @@ test('a lookup takes context from the newest reply, not the last one redrawn', a
   const w = await lookupWorld($, on, answering('A placeholder name.'))
   const older = 'The foo handler runs first.'
   const newer = 'Then the foo cache warms up.'
-  for (const [text, id] of [[older, 'a'], [newer, 'b'], [older, 'a-again']] as const) {
+  for (const [text, id] of [[older, 'a'], [newer, 'b'], [older, 'a']] as const) {
     const ui = await mountReply($, text, id)
     await ui.unmount()
   }
@@ -682,41 +788,69 @@ test('a lookup takes context from the newest reply, not the last one redrawn', a
   expect(w.asked[0]?.prompt).not.toContain(older)
 })
 
+test('a reply that left the recent list stays out when redrawn', async ($, on) => {
+  const w = await lookupWorld($, on, answering('A placeholder name.'))
+  const ids = ['r0', ...Array.from({ length: 20 }, (_, i) => `r${i + 1}`), 'r0']
+  for (const id of ids) {
+    const ui = await mountReply($, id === 'r0' ? 'The old foo path.' : `Filler reply ${id}.`, id)
+    await ui.unmount()
+  }
+  await $.command.run({ command: 'jargon', args: 'foo' } as never)
+  expect(w.asked.map(a => a.prompt)).toEqual(['Define: foo'])
+})
+
+test('a long reply goes to Haiku as an excerpt around the term', async ($, on) => {
+  const w = await lookupWorld($, on, answering('A placeholder name.'))
+  const long = 'Lorem ipsum dolor sit amet. '.repeat(200) + 'Here the zork takes over. ' + 'More text. '.repeat(200)
+  const ui = await mountReply($, long, 'long')
+  await ui.unmount()
+  await $.command.run({ command: 'jargon', args: 'zork' } as never)
+  const prompt = w.asked[0]?.prompt ?? ''
+  expect(prompt).toContain('Here the zork takes over.')
+  expect(prompt.length).toBeLessThan(1400)
+})
+
 test('with highlights off a lookup answers in text and pins nothing', async ($, on) => {
   await lookupWorld($, on, NO_ANSWER)
   await $.command.run({ command: 'jargon', args: 'off' } as never)
   const out = await $.command.run({ command: 'jargon', args: 'mutex' } as never)
   expect(out.text).toBe('**mutex**: A lock that lets only one task touch something at a time.')
 
-  const band = await $.ui.mount({
-    plugin: 'jargon',
-    surface: 'terminal',
-    component: 'AbovePrompt',
-    requestId: 'band',
-    viewport: { columns: 100, rows: 40 },
-    props: BAND_PROPS,
-  })
-  expect(await band.find({ type: 'Text', text: /engine's own/ })).toBeDefined()
-  await band.unmount()
+  for (const surface of SURFACES) {
+    const band = await mountBand($, surface)
+    expect(await band.find({ type: 'Text', text: /engine's own/ })).toBeDefined()
+    await band.unmount()
+  }
 })
 
 test('a term used only in code gets no chip', async ($, on) => {
   await lookupWorld($, on, NO_ANSWER, {
-    cache: { version: 1, glossary: { freenav: { term: 'freeNav', kind: 'k', definition: 'made up' } }, asked: 0 },
+    cache: {
+      version: 1,
+      glossary: { freenav: { term: 'freeNav', kind: 'k', definition: 'made up' } },
+      lookedUp: ['freenav'],
+      asked: 0,
+    },
   })
-  const ui = await mountReply($, 'Call `freeNav` after the `mutex` is released; a mutex guards it.', 'code')
-  expect(await chipsOf(ui, ['mutex', 'freenav'])).toEqual([
-    ['mutex', true],
-    ['freenav', false],
-  ])
-  await ui.unmount()
+  for (const surface of SURFACES) {
+    const ui = await mountReply($, 'Call `freeNav` after the `mutex` is released; a mutex guards it.', 'code', surface)
+    expect(await chipsOf(ui, ['mutex', 'freenav'])).toEqual([
+      ['mutex', true],
+      ['freenav', false],
+    ])
+    await ui.unmount()
 
-  const inCode = await mountReply($, 'Only `mutex` and `freeNav` here.', 'code-only')
-  expect(await chipsOf(inCode, ['mutex', 'freenav'])).toEqual([
-    ['mutex', false],
-    ['freenav', false],
-  ])
-  await inCode.unmount()
+    const inCode = await mountReply($, 'Only `mutex` and `freeNav` here.', 'code-only', surface)
+    expect(await chipsOf(inCode, ['mutex', 'freenav'])).toEqual([
+      ['mutex', false],
+      ['freenav', false],
+    ])
+    await inCode.unmount()
+
+    const inProse = await mountReply($, 'Then freeNav runs.', 'prose', surface)
+    expect(await chipsOf(inProse, ['freenav'])).toEqual([['freenav', true]])
+    await inProse.unmount()
+  }
 })
 
 test("a save keeps another session's lookups, and takes them in", async ($, on) => {
@@ -740,7 +874,7 @@ test("a save keeps another session's lookups, and takes them in", async ($, on) 
     JSON.stringify({
       version: 1,
       glossary: { k8s: { term: 'k8s', kind: 'k', definition: 'Runs containers.' } },
-      lookedUp: ['k8s', 'api'],
+      lookedUp: ['k8s', 'api', 'gone'],
       asked: 4,
     }),
   )
@@ -753,10 +887,12 @@ test("a save keeps another session's lookups, and takes them in", async ($, on) 
 
   // Taken in here too: the other session's lookups highlight in this one.
   await $.command.run({ command: 'jargon', args: 'level advanced' } as never)
-  const ui = await mountReply($, 'Ship it to k8s through the API.', 'merged')
-  expect(await chipsOf(ui, ['k8s', 'api'])).toEqual([
-    ['k8s', true],
-    ['api', true],
-  ])
-  await ui.unmount()
+  for (const surface of SURFACES) {
+    const ui = await mountReply($, 'Ship it to k8s through the API.', 'merged', surface)
+    expect(await chipsOf(ui, ['k8s', 'api'])).toEqual([
+      ['k8s', true],
+      ['api', true],
+    ])
+    await ui.unmount()
+  }
 })
